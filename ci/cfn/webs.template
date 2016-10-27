@@ -1,0 +1,313 @@
+---
+AWSTemplateFormatVersion: "2010-09-09"
+
+Description:
+  Build load balancer and web server AutoScaling group, deploying a build from S3.
+
+Parameters:
+  VPC:
+    Type: AWS::EC2::VPC::Id
+    Description: VPC to launch into.
+
+  PublicSubnetA:
+    Type: AWS::EC2::Subnet::Id
+    Description: Subnet to launch into.
+
+  AppName:
+    Type: String
+    Description: "Name of the application"
+    MinLength: 2
+    MaxLength: 15
+    Default: "a4tp"
+    AllowedPattern: "[a-z0-9][-. a-z0-9]*"
+    ConstraintDescription: >-
+      Must be between 2 and 15 characters long, lowercase and may
+      contain alphanumeric characters, hyphens (-), and dots (.), but
+      must start with alphanumeric.
+
+  KeyName:
+    Type: AWS::EC2::KeyPair::KeyName
+    Description: "Name of an existing EC2 KeyPair for SSH access to the instances."
+
+  BuildBucket:
+    Type: String
+    Description: Bucket containing the build to be deployed.
+
+  BuildKey:
+    Type: String
+    Default: initial-build.zip
+    Description: Key which points to the build to be deployed, in the BuildBucket.
+
+Mappings:
+  AWSRegionVirt2AMI:
+    # To find new base AMIs at any given time,
+    # visit https://aws.amazon.com/amazon-linux-ami/
+    us-east-1:
+      HVM: "ami-c481fad3"
+    us-west-2:
+      HVM: "ami-b04e92d0"
+
+Resources:
+  WebServerRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Statement:
+          - Sid: ""
+            Effect: Allow
+            Principal:
+              Service: ec2.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/AmazonEC2ReadOnlyAccess
+      Path: /
+
+  WebServerRolePolicies:
+    Type: AWS::IAM::Policy
+    Properties:
+      PolicyName: BackendRole
+      Roles:
+        - !Ref WebServerRole
+      PolicyDocument:
+        Statement:
+          - Effect: Allow
+            Action: cloudformation:DescribeStackResources
+            Resource: !Sub "arn:aws:cloudformation:${AWS::Region}:${AWS::AccountId}:stack/${AWS::StackName}/*"
+          - Effect: Allow
+            Action:
+              - autoscaling:Describe*
+              - autoscaling:EnterStandby
+              - autoscaling:ExitStandby
+              - autoscaling:UpdateAutoScalingGroup
+            Resource: "*"
+          - Effect: Allow
+            Action:
+              - ec2:DescribeInstances
+              - ec2:DescribeInstanceStatus
+            Resource: "*"
+          - Effect: Allow
+            Action:
+              - elasticloadbalancing:Describe*
+              - elasticloadbalancing:DeregisterInstancesFromLoadBalancer
+              - elasticloadbalancing:RegisterInstancesWithLoadBalancer
+            Resource: "*"
+          - Effect: Allow
+            Action:
+              - s3:Get*
+              - s3:List*
+            Resource:
+              - !Sub "arn:aws:s3:::${BuildBucket}"
+              - !Sub "arn:aws:s3:::${BuildBucket}/*"
+
+  WebServerInstanceProfile:
+    Type: AWS::IAM::InstanceProfile
+    Properties:
+      Path: /
+      Roles:
+        - !Ref WebServerRole
+
+  WebServerSG:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Enable HTTP access on port 80
+      VpcId: !Ref VPC
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 22
+          ToPort: 22
+          CidrIp: "0.0.0.0/0"
+        - IpProtocol: tcp
+          FromPort: 80
+          ToPort: 80
+          CidrIp: "0.0.0.0/0"
+      SecurityGroupEgress:
+        - IpProtocol: tcp
+          FromPort: 80
+          ToPort: 80
+          CidrIp: "0.0.0.0/0"
+        - IpProtocol: tcp
+          FromPort: 443
+          ToPort: 443
+          CidrIp: "0.0.0.0/0"
+        - IpProtocol: udp
+          FromPort: 123 # NTP protocol
+          ToPort: 123
+          CidrIp: "0.0.0.0/0"
+        - IpProtocol: udp
+          FromPort: 9418 # Git
+          ToPort: 9418
+          CidrIp: "0.0.0.0/0"
+        - IpProtocol: icmp
+          FromPort: -1  # any ICMP port: ping, etc.
+          ToPort: -1
+          CidrIp: "0.0.0.0/0"
+      Tags:
+        - Key: Name
+          Value: WebServerSG
+
+  WebServerBalancerSG:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Enable HTTP access on port 80
+      VpcId: !Ref VPC
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 80
+          ToPort: 80
+          CidrIp: "0.0.0.0/0"
+      Tags:
+        - Key: Name
+          Value: WebServerBalancerSG
+
+  WebServerBalancer:
+    Type: AWS::ElasticLoadBalancing::LoadBalancer
+    Properties:
+      CrossZone: true
+      Scheme: internet-facing
+      Subnets:
+        - !Ref PublicSubnetA
+      SecurityGroups:
+        - !Ref WebServerBalancerSG
+      Listeners:
+        - LoadBalancerPort: 80
+          InstancePort: 80
+          Protocol: HTTP
+      HealthCheck:
+        HealthyThreshold: 3
+        Interval: 5
+        Target: "HTTP:80/index.html"
+        Timeout: 2
+        UnhealthyThreshold: 3
+      ConnectionDrainingPolicy:
+        Enabled: True
+        Timeout: 10
+      Tags:
+        - Key: Name
+          Value: WebServerBalancer
+
+  WebServerLaunchConfig:
+    Type: AWS::AutoScaling::LaunchConfiguration
+    DependsOn:
+      - WebServerSG
+    Properties:
+      AssociatePublicIpAddress: true
+      ImageId: !FindInMap [ AWSRegionVirt2AMI, !Ref "AWS::Region", "HVM" ]
+      KeyName: !Ref KeyName
+      InstanceType: t2.micro
+      IamInstanceProfile: !Ref WebServerInstanceProfile
+      SecurityGroups:
+        - !Ref WebServerSG
+      UserData:
+        "Fn::Base64":
+          !Sub |
+            #!/bin/bash -ex
+            echo "Launching build ${BuildKey}"
+            yum update -y aws-cfn-bootstrap
+            # Update the AWS CLI to the latest version
+            yum install -y aws-cli
+            # Perform all security updates. The cloud-init system in Amazon Linux
+            # already applied the critical ones before this script started,
+            # but add the less-critical ones.
+            yum -y --security update
+
+            function error_exit
+            {
+            # If you need to debug crashing instances, try uncommenting this:
+            # echo "Sleeping for 5 minutes of debugging time"
+            # sleep 600
+            /opt/aws/bin/cfn-signal --exit-code 1 --region ${AWS::Region} --stack ${AWS::StackName} --resource WebServerASG
+            exit 1
+            }
+
+            # Run cfn-init to execute the ASG's AWS::CloudFormation::Init template
+            /opt/aws/bin/cfn-init -v --region ${AWS::Region} --stack ${AWS::StackName} --resource WebServerASG || error_exit "Failed to complete cfn-init"
+
+            # Run instance health check to confirm that the software
+            # deployed on this system is working
+            /usr/local/bin/healthcheck || error_exit "FAILED instance health check"
+
+            # If all went well, signal success
+            /opt/aws/bin/cfn-signal --exit-code 0 --region ${AWS::Region} --stack ${AWS::StackName} --resource WebServerASG
+
+  WebServerASG:
+    Type: AWS::AutoScaling::AutoScalingGroup
+    DependsOn:
+      - WebServerSG
+      - WebServerBalancerSG
+    Properties:
+      MinSize: 2
+      MaxSize: 2
+      DesiredCapacity: 2
+      LoadBalancerNames:
+        - !Ref WebServerBalancer
+      LaunchConfigurationName: !Ref WebServerLaunchConfig
+      Tags:
+        - Key: Name
+          Value: !Sub "${AppName}-webs-asg"
+          PropagateAtLaunch: true
+        - Key: ServerType
+          Value: "web"
+          PropagateAtLaunch: true
+      VPCZoneIdentifier:
+        - !Ref PublicSubnetA
+    CreationPolicy:
+      ResourceSignal:
+        Count: 2
+        Timeout: PT30M
+    UpdatePolicy:
+      AutoScalingReplacingUpdate:
+        WillReplace: true
+    Metadata:
+      # Edit this to change the instance configuration
+      "AWS::CloudFormation::Init":
+        config:
+          packages:
+            yum:
+              # We pin a specific version of nginx - adjust this when
+              # nginx security releases come out.
+              nginx: [ "1:1.10.1-1.28.amzn1.x86_64" ]
+          sources:
+            # The static site directory is read from the build artifact
+            /usr/share/nginx/html: !Sub "https://${BuildBucket}.s3.amazonaws.com/${BuildKey}"
+          files:
+            # For expediency we're putting the test code
+            # inline in this template.
+            # TODO: Include the healthcheck install in a more complex build artifact.
+            /usr/local/bin/healthcheck:
+              content: !Sub |
+                #!/bin/sh
+                function error_exit { echo "ERROR: $1"; exit 1; }
+                # Ensure that nginx is running
+                service nginx status 2>/dev/null | grep running >/dev/null || error_exit "nginx service is not running"
+                # Ensure that the stock nginx page is NOT running
+                curl localhost:80 2>/dev/null | grep 'If you can read this page' >/dev/null
+                if [ $? == 0 ]; then error_exit "nginx stock page appears to be being served"; fi
+                # Ensure that the requirements are being met on this instance
+                curl localhost:80 2>/dev/null | grep 'Automation for the People' >/dev/null || error_exit "could not find required message on home page"
+              mode: "000550"
+          commands:
+            ownership:
+              command: "chown -R nginx.nginx /usr/share/nginx/html"
+          services:
+            sysvinit:
+              nginx:
+                enabled: "true"
+                ensureRunning: "true"
+                files:
+                  - "/etc/nginx/nginx.conf"
+                sources:
+                  - "/usr/share/nginx/html"
+      "AWS::CloudFormation::Authentication":
+        "S3AccessKey":
+          type: S3
+          buckets:
+            - !Ref BuildBucket
+          roleName: !Ref WebServerRole
+
+Outputs:
+  ApplicationBuild:
+    Value: !Sub "https://${BuildBucket}.s3.amazonaws.com/${BuildKey}"
+    Description: Location of the app source code.
+  BalancerDNSName:
+    Value: !GetAtt WebServerBalancer.DNSName
+    Description: DNS name where the load-balanced site can be found.

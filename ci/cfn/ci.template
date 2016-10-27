@@ -1,0 +1,374 @@
+---
+AWSTemplateFormatVersion: "2010-09-09"
+
+Description:
+  Build VPC with public subnet, IGW, route tables, ACL, CodePipeline.
+
+Parameters:
+  AppName:
+    Type: String
+    Description: "Name of the application"
+    MinLength: 2
+    MaxLength: 15
+    Default: "a4tp"
+    AllowedPattern: "[a-z0-9][-. a-z0-9]*"
+    ConstraintDescription: >-
+      Must be between 2 and 15 characters long, lowercase and may
+      contain alphanumeric characters, hyphens (-), and dots (.), but
+      must start with alphanumeric.
+
+  WebStackName:
+    Type: String
+    Description: "Name of the CFN stack that will run web servers."
+    MinLength: 2
+    MaxLength: 15
+    Default: "a4tp-web"
+    AllowedPattern: "[a-z0-9][-. a-z0-9]*"
+    ConstraintDescription: >-
+      Must be between 2 and 15 characters long, lowercase and may
+      contain alphanumeric characters, hyphens (-), and dots (.), but
+      must start with alphanumeric.
+
+  BuildBucket:
+    Type: String
+    Description: Name of the bucket containing builds.
+
+  LambdaKey:
+    Type: String
+    Description: Key of the zip file in the BuildBucket which contains Lambda function code.
+
+  LambdaLatestVersion:
+    Type: String
+    Description: Latest version of the  zip file in the BuildBucket which contains Lambda function code.
+
+  GitHubUser:
+    Type: String
+    Default: mechfish
+    Description: Your GitHub username
+
+  GitHubToken:
+    Type: String
+    Description: >-
+      Go to https://github.com/settings/tokens to create/find a token for your account.
+
+  GitHubRepoName:
+    Type: String
+    Default: aws-ci-demo
+    Description: Name of the repository containing the application.
+
+  GitHubBranchName:
+    Type: String
+    Default: master
+    Description: Name of the branch that should be deployed.
+
+  KeyName:
+    Type: AWS::EC2::KeyPair::KeyName
+    Description: "Name of an existing EC2 KeyPair for SSH access to the instances."
+
+Mappings:
+  VPCIpSpace:
+    us-east-1:
+      RANGE: 10.42
+    us-west-2:
+      RANGE: 10.43
+
+  SubnetTypeIpRanges:
+    public:
+      RANGE: 0.0/17
+
+  publicSubnetConfig:
+    publicSubnetA:
+      CIDR: 10.0/24
+
+Resources:
+  MyVPC:
+    Type: AWS::EC2::VPC
+    Properties:
+      CidrBlock: !Sub
+        - "${Ipspc}.0.0/16"
+        - { Ipspc: !FindInMap [ VPCIpSpace, !Ref "AWS::Region", "RANGE" ]}
+      EnableDnsSupport: true
+      EnableDnsHostnames: true
+      Tags:
+        - Key: Name
+          Value: AwsCiDemo-VPC
+
+  publicSubnetA:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref MyVPC
+      CidrBlock: !Sub
+        - "${Ipspc}.${SubnetConf}"
+        - Ipspc: !FindInMap [ VPCIpSpace, !Ref "AWS::Region", "RANGE" ]
+          SubnetConf: !FindInMap [ publicSubnetConfig, "publicSubnetA", "CIDR" ]
+      AvailabilityZone: !Select [ 0, !GetAZs "" ]
+      Tags:
+        - Key: SubnetType
+          Value: Public
+        - Key: Name
+          Value: publicSubnetA
+
+  InternetGateway:
+    Type: AWS::EC2::InternetGateway
+    Properties:
+      Tags:
+        - Key: Name
+          Value: AwsCiDemoIGW
+
+  AttachGateway:
+    Type: AWS::EC2::VPCGatewayAttachment
+    Properties:
+      VpcId: !Ref MyVPC
+      InternetGatewayId: !Ref InternetGateway
+
+  PublicRouteTable:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId: !Ref MyVPC
+      Tags:
+        - Key: Name
+          Value: PublicRouteTable
+
+  PublicRoute:
+    Type: AWS::EC2::Route
+    DependsOn:
+      - AttachGateway
+    Properties:
+      RouteTableId: !Ref PublicRouteTable
+      DestinationCidrBlock: "0.0.0.0/0"
+      GatewayId: !Ref InternetGateway
+
+  PublicSubnetRTAssociationA:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref publicSubnetA
+      RouteTableId: !Ref PublicRouteTable
+
+  PublicNetworkAcl:
+    Type: AWS::EC2::NetworkAcl
+    Properties:
+      VpcId: !Ref MyVPC
+      Tags:
+        - Key: Name
+          Value: NetworkAcl
+
+  InboundPublicNAclEntry:
+    Type: AWS::EC2::NetworkAclEntry
+    DependsOn:
+      - PublicNetworkAcl
+    Properties:
+      NetworkAclId: !Ref PublicNetworkAcl
+      RuleNumber: 2000
+      Protocol: -1
+      RuleAction: allow
+      Egress: false
+      CidrBlock: "0.0.0.0/0"
+      PortRange:
+        From: 0
+        To: 65535
+
+  OutboundPublicNAclEntry:
+    Type: AWS::EC2::NetworkAclEntry
+    DependsOn:
+      - PublicNetworkAcl
+    Properties:
+      NetworkAclId: !Ref PublicNetworkAcl
+      RuleNumber: 2000
+      Protocol: -1
+      RuleAction: allow
+      Egress: true
+      CidrBlock: "0.0.0.0/0"
+      PortRange:
+        From: 0
+        To: 65535
+
+  publicSubnetNetworkAclAssociationA:
+    Type: AWS::EC2::SubnetNetworkAclAssociation
+    DependsOn:
+      - PublicNetworkAcl
+    Properties:
+      SubnetId: !Ref publicSubnetA
+      NetworkAclId: !Ref PublicNetworkAcl
+
+  CodePipelineLambdaRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Sid: ""
+            Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+          - Sid: "1"
+            Effect: Allow
+            Principal:
+              Service: codepipeline.amazonaws.com
+            Action: sts:AssumeRole
+      Path: /
+
+  CodePipelineLambdaPolicy:
+    Type: AWS::IAM::Policy
+    DependsOn:
+      - CodePipelineLambdaRole
+    Properties:
+      PolicyName: CodePipelineLambdaPolicy
+      Roles:
+        - !Ref CodePipelineLambdaRole
+      PolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Action:
+              - "logs:*"
+            Resource:
+              - "arn:aws:logs:*:*:*"
+          - Effect: Allow
+            Action:
+              - codepipeline:AcknowledgeJob
+              - codepipeline:GetJobDetails
+              - codepipeline:PutJobSuccessResult
+              - codepipeline:PutJobFailureResult
+              # Okay, I don't have time to do the dance where I
+              # iteratively lock down the permissions, so here's a
+              # BIG SCARY shortcut!
+              #
+              # TODO: get rid of this
+              - "ec2:*"
+              - "cloudformation:*"
+              - "s3:*"
+              - "iam:*"
+              - "elasticloadbalancing:*"
+              - "autoscaling:*"
+              - "lambda:*"
+            Resource: "*"
+
+  CodePipelineLambdaBuild:
+    Type: AWS::Lambda::Function
+    DependsOn:
+      - CodePipelineLambdaRole
+      - CodePipelineLambdaPolicy
+    Properties:
+      Code:
+        S3Bucket: !Ref BuildBucket
+        S3Key: !Ref LambdaKey
+        S3ObjectVersion: !Ref LambdaLatestVersion
+      Role: !GetAtt CodePipelineLambdaRole.Arn
+      Description: "Make a build and store it in S3"
+      Timeout: 20
+      Handler: lambdabuild.lambda_handler
+      Runtime: python2.7
+      MemorySize: 128
+
+  CodePipelineLambdaUpdate:
+    Type: AWS::Lambda::Function
+    DependsOn:
+      - CodePipelineLambdaRole
+      - CodePipelineLambdaPolicy
+    Properties:
+      Code:
+        S3Bucket: !Ref BuildBucket
+        S3Key: !Ref LambdaKey
+        S3ObjectVersion: !Ref LambdaLatestVersion
+      Role: !GetAtt CodePipelineLambdaRole.Arn
+      Description: "Deploy a build by updating the AutoScaling CFN stack."
+      Timeout: 20
+      Handler: lambdaupdate.lambda_handler
+      Runtime: python2.7
+      MemorySize: 128
+
+  CiPipeline:
+    Type: AWS::CodePipeline::Pipeline
+    DependsOn:
+      - CodePipelineLambdaBuild
+      - CodePipelineLambdaUpdate
+    Properties:
+      Name: !Sub "${AppName}-Pipeline"
+      RoleArn: !GetAtt CodePipelineLambdaRole.Arn
+      ArtifactStore:
+        Type: S3
+        Location: !Ref BuildBucket
+      Stages:
+        - Name: Source
+          Actions:
+            - InputArtifacts: []
+              Name: Source
+              ActionTypeId:
+                Category: Source
+                Owner: ThirdParty
+                Version: 1
+                Provider: GitHub
+              OutputArtifacts:
+                - Name: !Sub "${AppName}-SourceArtifact"
+              Configuration:
+                Owner: !Ref GitHubUser
+                Repo: !Ref GitHubRepoName
+                Branch: !Ref GitHubBranchName
+                OAuthToken: !Ref GitHubToken
+              RunOrder: 1
+        - Name: Build
+          Actions:
+            - InputArtifacts:
+                - Name: !Sub "${AppName}-SourceArtifact"
+              Name: Build
+              ActionTypeId:
+                Category: Invoke
+                Owner: AWS
+                Version: 1
+                Provider: Lambda
+              OutputArtifacts:
+                - Name: !Sub "${AppName}-Build"
+                - Name: !Sub "${AppName}-Template"
+              Configuration:
+                FunctionName: !Ref CodePipelineLambdaBuild
+                UserParameters: !Sub |
+                  {"source_artifact": "${AppName}-SourceArtifact",
+                  "build_artifact": "${AppName}-Build",
+                  "template_artifact": "${AppName}-Template",
+                  "template_subdir_path": "ci/cfn"}
+              RunOrder: 1
+        - Name: Release
+          Actions:
+            - InputArtifacts:
+                - Name: !Sub "${AppName}-Build"
+                - Name: !Sub "${AppName}-Template"
+              Name: UpdateStack
+              ActionTypeId:
+                Category: Invoke
+                Owner: AWS
+                Version: 1
+                Provider: Lambda
+              OutputArtifacts: []
+              Configuration:
+                FunctionName: !Ref CodePipelineLambdaUpdate
+                UserParameters: !Sub |
+                  {"web_stack_name": "${WebStackName}",
+                  "build_artifact": "${AppName}-Build",
+                  "template_artifact": "${AppName}-Template",
+                  "template_file": "webs.template",
+                  "vpc_id": "${MyVPC}",
+                  "subnet_id_a": "${publicSubnetA}",
+                  "appname": "${AppName}",
+                  "keyname": "${KeyName}"}
+              RunOrder: 1
+
+Outputs:
+  VpcId:
+    Value: !Ref MyVPC
+    Description: VPC ID
+  IGWId:
+    Value: !Ref InternetGateway
+    Description: Internet Gateway ID
+  PublicSubnetA:
+    Value: !Ref publicSubnetA
+    Description: Public subnet in AZ A
+  ApplicationSource:
+    Value: !Sub "https://github.com/${GitHubUser}/${GitHubRepoName}/tree/${GitHubBranchName}"
+    Description: Location of the app source code.
+  WebStackName:
+    Value: !Ref WebStackName
+  CodePipeline:
+    Value: !Ref CiPipeline
+  CodePipelineURL:
+    Value: !Sub "https://console.aws.amazon.com/codepipeline/home?region=${AWS::Region}#/view/${CiPipeline}"
